@@ -26,9 +26,21 @@ from agent.redact import redact_sensitive_text
 
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
+_OPENCODE_DEFAULT_FALLBACK_MODELS = (
+    "opencode/deepseek-v4-flash-free",
+    "opencode/mimo-v2.5-free",
+    "opencode/nemotron-3-super-free",
+    "opencode/big-pickle",
+)
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
+
+
+class _ACPAttemptError(RuntimeError):
+    def __init__(self, message: str, *, prompt_sent: bool = False):
+        super().__init__(message)
+        self.prompt_sent = prompt_sent
 
 # Stderr fingerprint of the deprecated `gh copilot` CLI extension
 # (https://github.blog/changelog/2025-09-25-upcoming-deprecation-of-gh-copilot-cli-extension).
@@ -93,12 +105,14 @@ def _resolve_home_dir() -> str:
     return "/tmp"
 
 
-def _build_subprocess_env() -> dict[str, str]:
+def _build_subprocess_env(extra_env: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
-    home = _resolve_home_dir()
-    env["HOME"] = home
+    env["HOME"] = _resolve_home_dir()
     from hermes_constants import apply_subprocess_home_env
+
     apply_subprocess_home_env(env)
+    if extra_env:
+        env.update(extra_env)
     return env
 
 
@@ -130,13 +144,22 @@ def _format_messages_as_prompt(
     model: str | None = None,
     tools: list[dict[str, Any]] | None = None,
     tool_choice: Any = None,
+    native_acp_tools: bool = False,
 ) -> str:
-    sections: list[str] = [
-        "You are being used as the active ACP agent backend for Hermes.",
-        "Use ACP capabilities to complete tasks.",
-        "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
-        "If no tool is needed, answer normally.",
-    ]
+    if native_acp_tools:
+        sections: list[str] = [
+            "You are being used as the active ACP agent backend for Hermes.",
+            "Use your native ACP/OpenCode tools normally to complete tasks.",
+            "Do not emit Hermes <tool_call>{...}</tool_call> JSON blocks; call the tools exposed by your ACP runtime directly.",
+            "When finished, answer with a concise summary of files changed, validation, and issues.",
+        ]
+    else:
+        sections = [
+            "You are being used as the active ACP agent backend for Hermes.",
+            "Use ACP capabilities to complete tasks.",
+            "IMPORTANT: If you take an action with a tool, you MUST output tool calls using <tool_call>{...}</tool_call> blocks with JSON exactly in OpenAI function-call shape.",
+            "If no tool is needed, answer normally.",
+        ]
     if model:
         sections.append(f"Hermes requested model hint: {model}")
 
@@ -311,6 +334,52 @@ def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
     return resolved
 
 
+def _is_opencode_command(command: str) -> bool:
+    name = Path(command).name.lower()
+    return name == "opencode" or name.startswith("opencode.")
+
+
+def _is_opencode_invocation(command: str, args: list[str] | None = None) -> bool:
+    if _is_opencode_command(command):
+        return True
+    wrapper_names = {"npx", "bunx", "pnpm", "yarn", "node"}
+    if Path(command).name.lower() not in wrapper_names:
+        return False
+    return any("opencode" in str(arg).lower() for arg in (args or []))
+
+
+def _opencode_fallback_models() -> tuple[str, ...]:
+    raw = os.getenv("HERMES_OPENCODE_ACP_FALLBACK_MODELS", "").strip()
+    if not raw:
+        return _OPENCODE_DEFAULT_FALLBACK_MODELS
+    models = [part.strip() for part in re.split(r"[,\s]+", raw) if part.strip()]
+    return tuple(dict.fromkeys(models)) or _OPENCODE_DEFAULT_FALLBACK_MODELS
+
+
+def _opencode_config_content_for_model(model: str) -> str:
+    agent_names = ("build", "plan", "general", "explore", "summary", "title", "compaction")
+    agents: dict[str, Any] = {name: {"model": model} for name in agent_names}
+    if os.getenv("HERMES_OPENCODE_ACP_FALLBACK_ALLOW_MUTATING_TOOLS") == "1":
+        agents["build"]["permission"] = {
+            "read": "allow",
+            "glob": "allow",
+            "grep": "allow",
+            "list": "allow",
+            "edit": "allow",
+            "bash": "allow",
+            "external_directory": "deny",
+        }
+    return json.dumps(
+        {
+            "$schema": "https://opencode.ai/config.json",
+            "model": model,
+            "small_model": model,
+            "agent": agents,
+        },
+        ensure_ascii=False,
+    )
+
+
 class _ACPChatCompletions:
     def __init__(self, client: "CopilotACPClient"):
         self._client = client
@@ -346,6 +415,7 @@ class CopilotACPClient:
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
         self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self._native_acp_tools = _is_opencode_invocation(self._acp_command, self._acp_args)
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False
         self._active_process: subprocess.Popen[str] | None = None
@@ -381,8 +451,9 @@ class CopilotACPClient:
         prompt_text = _format_messages_as_prompt(
             messages or [],
             model=model,
-            tools=tools,
-            tool_choice=tool_choice,
+            tools=None if self._native_acp_tools else tools,
+            tool_choice=None if self._native_acp_tools else tool_choice,
+            native_acp_tools=self._native_acp_tools,
         )
         # Normalise timeout: run_agent.py may pass an httpx.Timeout object
         # (used natively by the OpenAI SDK) rather than a plain float.
@@ -405,7 +476,11 @@ class CopilotACPClient:
             timeout_seconds=_effective_timeout,
         )
 
-        tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
+        if self._native_acp_tools:
+            tool_calls = []
+            cleaned_text = response_text
+        else:
+            tool_calls, cleaned_text = _extract_tool_calls_from_text(response_text)
 
         usage = SimpleNamespace(
             prompt_tokens=0,
@@ -429,6 +504,43 @@ class CopilotACPClient:
         )
 
     def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+        if not self._native_acp_tools:
+            return self._run_prompt_once(prompt_text, timeout_seconds=timeout_seconds)
+
+        failures: list[str] = []
+        attempts: list[tuple[str | None, dict[str, str] | None]] = [(None, None)]
+        attempts.extend(
+            (
+                model,
+                {"OPENCODE_CONFIG_CONTENT": _opencode_config_content_for_model(model)},
+            )
+            for model in _opencode_fallback_models()
+        )
+        seen: set[str | None] = set()
+        for model, extra_env in attempts:
+            if model in seen:
+                continue
+            seen.add(model)
+            try:
+                return self._run_prompt_once(
+                    prompt_text,
+                    timeout_seconds=timeout_seconds,
+                    extra_env=extra_env,
+                )
+            except Exception as exc:
+                label = model or "configured-default"
+                failures.append(f"{label}: {type(exc).__name__}: {exc}")
+                if getattr(exc, "prompt_sent", False) and os.getenv("HERMES_OPENCODE_ACP_RETRY_AFTER_PROMPT") != "1":
+                    break
+        raise RuntimeError("OpenCode ACP failed for all configured fallback models: " + " | ".join(failures))
+
+    def _run_prompt_once(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        extra_env: dict[str, str] | None = None,
+    ) -> tuple[str, str]:
         try:
             proc = subprocess.Popen(
                 [self._acp_command] + self._acp_args,
@@ -438,7 +550,7 @@ class CopilotACPClient:
                 text=True,
                 bufsize=1,
                 cwd=self._acp_cwd,
-                env=_build_subprocess_env(),
+                env=_build_subprocess_env(extra_env),
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
@@ -479,6 +591,8 @@ class CopilotACPClient:
 
         next_id = 0
 
+        prompt_sent = False
+
         def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None) -> Any:
             nonlocal next_id
             next_id += 1
@@ -514,8 +628,10 @@ class CopilotACPClient:
                     continue
                 if "error" in msg:
                     err = msg.get("error") or {}
-                    raise RuntimeError(
+                    raise _ACPAttemptError(
                         f"Copilot ACP {method} failed: {err.get('message') or err}"
+                        ,
+                        prompt_sent=prompt_sent,
                     )
                 return msg.get("result")
 
@@ -536,8 +652,8 @@ class CopilotACPClient:
                         "directly with a Copilot subscription token) via `hermes setup`.\n\n"
                         f"Original error:\n{stderr_text}"
                     )
-                raise RuntimeError(f"Copilot ACP process exited early: {stderr_text}")
-            raise TimeoutError(f"Timed out waiting for Copilot ACP response to {method}.")
+                raise _ACPAttemptError(f"Copilot ACP process exited early: {stderr_text}", prompt_sent=prompt_sent)
+            raise _ACPAttemptError(f"Timed out waiting for Copilot ACP response to {method}.", prompt_sent=prompt_sent)
 
         try:
             _request(
@@ -570,20 +686,29 @@ class CopilotACPClient:
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
-            _request(
-                "session/prompt",
-                {
-                    "sessionId": session_id,
-                    "prompt": [
-                        {
-                            "type": "text",
-                            "text": prompt_text,
-                        }
-                    ],
-                },
-                text_parts=text_parts,
-                reasoning_parts=reasoning_parts,
-            )
+            prompt_sent = True
+            try:
+                _request(
+                    "session/prompt",
+                    {
+                        "sessionId": session_id,
+                        "prompt": [
+                            {
+                                "type": "text",
+                                "text": prompt_text,
+                            }
+                        ],
+                    },
+                    text_parts=text_parts,
+                    reasoning_parts=reasoning_parts,
+                )
+            except _ACPAttemptError:
+                raise
+            except Exception as exc:
+                raise _ACPAttemptError(
+                    f"Copilot ACP session/prompt failed: {exc}",
+                    prompt_sent=True,
+                ) from exc
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
             self.close()

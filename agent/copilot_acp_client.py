@@ -348,6 +348,31 @@ def _is_opencode_invocation(command: str, args: list[str] | None = None) -> bool
     return any("opencode" in str(arg).lower() for arg in (args or []))
 
 
+def _derive_acp_cwd(
+    acp_cwd: str | None,
+    acp_command: str,
+    acp_args: list[str],
+) -> str | None:
+    """Derive ACP working directory, or *None* to use ``os.getcwd()``.
+
+    Priority (highest first):
+
+    1. Explicit *acp_cwd* argument.
+    2. ``--cwd`` extracted from *acp_args* when *acp_command* is an OpenCode
+       invocation (both ``--cwd /path`` and ``--cwd=/path`` forms).
+    3. ``None`` — caller falls back to ``os.getcwd()``.
+    """
+    if acp_cwd is not None:
+        return str(Path(acp_cwd).resolve())
+    if _is_opencode_invocation(acp_command, acp_args):
+        for i, arg in enumerate(acp_args):
+            if arg == "--cwd" and i + 1 < len(acp_args):
+                return str(Path(acp_args[i + 1]).resolve())
+            if arg.startswith("--cwd="):
+                return str(Path(arg[len("--cwd="):]).resolve())
+    return None
+
+
 def _opencode_fallback_models() -> tuple[str, ...]:
     raw = os.getenv("HERMES_OPENCODE_ACP_FALLBACK_MODELS", "").strip()
     if not raw:
@@ -414,7 +439,7 @@ class CopilotACPClient:
         self._default_headers = dict(default_headers or {})
         self._acp_command = acp_command or command or _resolve_command()
         self._acp_args = list(acp_args or args or _resolve_args())
-        self._acp_cwd = str(Path(acp_cwd or os.getcwd()).resolve())
+        self._acp_cwd = _derive_acp_cwd(acp_cwd, self._acp_command, self._acp_args) or str(Path(os.getcwd()).resolve())
         self._native_acp_tools = _is_opencode_invocation(self._acp_command, self._acp_args)
         self.chat = _ACPChatNamespace(self)
         self.is_closed = False

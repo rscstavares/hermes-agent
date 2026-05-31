@@ -146,6 +146,50 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         self.assertFalse(outside.exists())
 
 
+# ── ACP cwd derivation tests ─────────────────────────────────────────
+
+import os as _os
+from pathlib import Path as _Path
+from unittest.mock import patch as _patch
+
+
+def test_opencode_acp_args_with_cwd_sets_acp_cwd(tmp_path):
+    client = CopilotACPClient(
+        acp_command="/home/user/opencode",
+        acp_args=["acp", "--cwd", str(tmp_path)],
+    )
+    assert _Path(client._acp_cwd).resolve() == _Path(tmp_path).resolve()
+
+
+def test_opencode_acp_args_with_cwd_eq_form_sets_acp_cwd(tmp_path):
+    client = CopilotACPClient(
+        acp_command="/home/user/opencode",
+        acp_args=["acp", f"--cwd={tmp_path}"],
+    )
+    assert _Path(client._acp_cwd).resolve() == _Path(tmp_path).resolve()
+
+
+def test_explicit_acp_cwd_overrides_opencode_cwd_arg(tmp_path):
+    other = tmp_path / "other"
+    other.mkdir()
+    client = CopilotACPClient(
+        acp_command="/home/user/opencode",
+        acp_args=["acp", "--cwd", str(tmp_path)],
+        acp_cwd=str(other),
+    )
+    assert _Path(client._acp_cwd).resolve() == _Path(other).resolve()
+
+
+def test_non_opencode_command_ignores_cwd_arg(tmp_path):
+    with _patch.dict(_os.environ, {}, clear=True):
+        with _patch("agent.copilot_acp_client.os.getcwd", return_value=str(tmp_path)):
+            client = CopilotACPClient(
+                acp_command="copilot",
+                acp_args=["--acp", "--cwd", "/some/other/dir"],
+            )
+    assert _Path(client._acp_cwd).resolve() == _Path(tmp_path).resolve()
+
+
 if __name__ == "__main__":
     unittest.main()
 

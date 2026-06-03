@@ -38,6 +38,8 @@ _OPENCODE_DEFAULT_FALLBACK_MODELS = (
     "opencode/nemotron-3-super-free",
     "opencode/big-pickle",
 )
+_OPENCODE_PREFLIGHT_OK = "HERMES_OPENCODE_ACP_PREFLIGHT_OK"
+_OPENCODE_DEFAULT_PREFLIGHT_TIMEOUT_SECONDS = 45.0
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
@@ -453,16 +455,7 @@ def _opencode_fallback_models() -> tuple[str, ...]:
 def _opencode_config_content_for_model(model: str) -> str:
     agent_names = ("build", "plan", "general", "explore", "summary", "title", "compaction")
     agents: dict[str, Any] = {name: {"model": model} for name in agent_names}
-    if os.getenv("HERMES_OPENCODE_ACP_FALLBACK_ALLOW_MUTATING_TOOLS") == "1":
-        agents["build"]["permission"] = {
-            "read": "allow",
-            "glob": "allow",
-            "grep": "allow",
-            "list": "allow",
-            "edit": "allow",
-            "bash": "allow",
-            "external_directory": "deny",
-        }
+    agents["build"]["permission"] = _opencode_build_permissions()
     return json.dumps(
         {
             "$schema": "https://opencode.ai/config.json",
@@ -472,6 +465,47 @@ def _opencode_config_content_for_model(model: str) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _opencode_build_permissions() -> dict[str, str]:
+    """Return non-interactive repo-local OpenCode permissions for fallback config."""
+
+    config_path = Path(os.getenv("OPENCODE_CONFIG", "~/.config/opencode/opencode.json")).expanduser()
+    try:
+        raw = json.loads(config_path.read_text())
+        permission = (((raw.get("agent") or {}).get("build") or {}).get("permission") or {})
+        if isinstance(permission, dict) and permission:
+            return {str(k): str(v) for k, v in permission.items()}
+    except Exception:
+        pass
+    return {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "edit": "allow",
+        "bash": "allow",
+        "external_directory": "deny",
+    }
+
+
+def _opencode_preflight_timeout() -> float:
+    raw = os.getenv("HERMES_OPENCODE_ACP_PREFLIGHT_TIMEOUT", "").strip()
+    if not raw:
+        return _OPENCODE_DEFAULT_PREFLIGHT_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _OPENCODE_DEFAULT_PREFLIGHT_TIMEOUT_SECONDS
+    return max(5.0, min(value, 180.0))
+
+
+def _short_failure_text(stdout: str, stderr: str) -> str:
+    combined = "\n".join(part.strip() for part in (stdout, stderr) if part and part.strip())
+    combined = redact_sensitive_text(combined)
+    if len(combined) > 1200:
+        combined = combined[:1200] + "…"
+    return combined or "no output"
 
 
 class _ACPChatCompletions:
@@ -620,6 +654,7 @@ class CopilotACPClient:
                 continue
             seen.add(model)
             try:
+                self._preflight_opencode_attempt(model_label=model or "configured-default", extra_env=extra_env)
                 return self._run_prompt_once(
                     prompt_text,
                     timeout_seconds=timeout_seconds,
@@ -631,6 +666,41 @@ class CopilotACPClient:
                 if getattr(exc, "prompt_sent", False) and os.getenv("HERMES_OPENCODE_ACP_RETRY_AFTER_PROMPT") != "1":
                     break
         raise RuntimeError("OpenCode ACP failed for all configured fallback models: " + " | ".join(failures))
+
+    def _preflight_opencode_attempt(self, *, model_label: str, extra_env: dict[str, str] | None) -> None:
+        """Fail fast on hosted-model quota/stall before starting a mutating ACP prompt."""
+
+        if os.getenv("HERMES_OPENCODE_ACP_PREFLIGHT", "1") == "0":
+            return
+        if not _is_opencode_command(self._acp_command):
+            return
+        prompt = f"Read-only preflight. Do not edit files. Respond with exactly: {_OPENCODE_PREFLIGHT_OK}"
+        cmd = [self._acp_command, "run", prompt]
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=self._acp_cwd,
+                env=_build_subprocess_env(extra_env),
+                text=True,
+                capture_output=True,
+                timeout=_opencode_preflight_timeout(),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise _ACPAttemptError(
+                f"OpenCode preflight timed out for {model_label} after {_opencode_preflight_timeout():.0f}s.",
+                prompt_sent=False,
+            ) from exc
+        except OSError as exc:
+            raise _ACPAttemptError(
+                f"OpenCode preflight could not start for {model_label}: {exc}",
+                prompt_sent=False,
+            ) from exc
+        if result.returncode != 0 or _OPENCODE_PREFLIGHT_OK not in (result.stdout or ""):
+            raise _ACPAttemptError(
+                "OpenCode preflight failed for "
+                f"{model_label}: rc={result.returncode}; {_short_failure_text(result.stdout or '', result.stderr or '')}",
+                prompt_sent=False,
+            )
 
     def _run_prompt_once(
         self,

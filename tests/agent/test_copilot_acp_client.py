@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from agent.copilot_acp_client import CopilotACPClient
+from agent.copilot_acp_client import _opencode_config_content_for_model
 
 
 class _FakeProcess:
@@ -356,3 +357,58 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
 
     assert "env" in captured["kwargs"]
     assert captured["kwargs"]["env"]["HOME"]
+
+
+# ── OpenCode fallback preflight tests ────────────────────────────────
+
+def test_opencode_fallback_config_preserves_build_permissions(monkeypatch, tmp_path):
+    config = tmp_path / "opencode.json"
+    config.write_text(json.dumps({
+        "agent": {
+            "build": {
+                "permission": {
+                    "read": "allow",
+                    "edit": "allow",
+                    "bash": "allow",
+                    "external_directory": "deny",
+                }
+            }
+        }
+    }))
+    monkeypatch.setenv("OPENCODE_CONFIG", str(config))
+
+    fallback = json.loads(_opencode_config_content_for_model("opencode/nemotron-3-super-free"))
+
+    assert fallback["model"] == "opencode/nemotron-3-super-free"
+    assert fallback["small_model"] == "opencode/nemotron-3-super-free"
+    assert fallback["agent"]["build"]["permission"]["edit"] == "allow"
+    assert fallback["agent"]["build"]["permission"]["external_directory"] == "deny"
+
+
+def test_opencode_preflight_skips_rate_limited_default_and_uses_fallback(monkeypatch, tmp_path):
+    client = CopilotACPClient(
+        acp_command="/usr/bin/opencode",
+        acp_args=["acp", "--cwd", str(tmp_path)],
+    )
+    monkeypatch.setenv("HERMES_OPENCODE_ACP_FALLBACK_MODELS", "opencode/nemotron-3-super-free")
+    attempted: list[str] = []
+
+    def fake_run(cmd, **kwargs):
+        assert cmd[:2] == ["/usr/bin/opencode", "run"]
+        config_content = (kwargs.get("env") or {}).get("OPENCODE_CONFIG_CONTENT")
+        model = json.loads(config_content)["model"] if config_content else "configured-default"
+        attempted.append(model)
+        if model == "configured-default":
+            return type("Result", (), {"returncode": 1, "stdout": "", "stderr": "FreeUsageLimitError"})()
+        return type("Result", (), {"returncode": 0, "stdout": "HERMES_OPENCODE_ACP_PREFLIGHT_OK", "stderr": ""})()
+
+    def fake_once(prompt_text, *, timeout_seconds, extra_env=None):
+        assert extra_env is not None
+        assert json.loads(extra_env["OPENCODE_CONFIG_CONTENT"])["model"] == "opencode/nemotron-3-super-free"
+        return "fallback used", ""
+
+    monkeypatch.setattr("agent.copilot_acp_client.subprocess.run", fake_run)
+    monkeypatch.setattr(client, "_run_prompt_once", fake_once)
+
+    assert client._run_prompt("hello", timeout_seconds=10) == ("fallback used", "")
+    assert attempted == ["configured-default", "opencode/nemotron-3-super-free"]

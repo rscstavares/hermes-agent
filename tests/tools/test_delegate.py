@@ -11,8 +11,10 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import sys
 import threading
 import time
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -57,6 +59,73 @@ def _make_mock_parent(depth=0):
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     return parent
+
+
+class TestBuildChildAgentOpenCodeCwd(unittest.TestCase):
+    def _capture_child_kwargs(self, **kwargs):
+        child = MagicMock()
+        child.session_id = "child-session"
+        self.captured_child_kwargs = kwargs
+        return child
+
+    def test_wsl_opencode_preserves_explicit_cwd_arg(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+        parent.terminal_cwd = "/mnt/c/Users/Rodrigo Tavares"
+        self.captured_child_kwargs = {}
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._is_wsl_runtime", return_value=True),
+            patch.dict(sys.modules, {"run_agent": types.SimpleNamespace(AIAgent=self._capture_child_kwargs)}),
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="smoke",
+                context=None,
+                toolsets=["terminal", "file"],
+                model=None,
+                max_iterations=3,
+                task_count=1,
+                parent_agent=parent,
+                override_acp_command="/home/rodrigo_tavares/.opencode/bin/opencode",
+                override_acp_args=["acp", "--cwd", "/tmp/target-repo"],
+            )
+
+        self.assertEqual(
+            self.captured_child_kwargs["acp_args"],
+            ["acp", "--cwd", "/tmp/target-repo"],
+        )
+
+    def test_wsl_opencode_adds_workspace_cwd_only_when_missing(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+        workspace = "/tmp"
+        parent.terminal_cwd = workspace
+        self.captured_child_kwargs = {}
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._is_wsl_runtime", return_value=True),
+            patch.dict(sys.modules, {"run_agent": types.SimpleNamespace(AIAgent=self._capture_child_kwargs)}),
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="smoke",
+                context=None,
+                toolsets=["terminal", "file"],
+                model=None,
+                max_iterations=3,
+                task_count=1,
+                parent_agent=parent,
+                override_acp_command="/home/rodrigo_tavares/.opencode/bin/opencode",
+                override_acp_args=["acp"],
+            )
+
+        self.assertEqual(
+            self.captured_child_kwargs["acp_args"],
+            ["acp", "--cwd", workspace],
+        )
 
 
 class TestDelegateRequirements(unittest.TestCase):
@@ -190,6 +259,51 @@ class TestStripBlockedTools(unittest.TestCase):
 
 
 class TestDelegateTask(unittest.TestCase):
+    def test_configured_opencode_acp_cwd_is_not_overwritten_on_wsl(self):
+        parent = _make_mock_parent()
+        parent.terminal_cwd = "/mnt/c/Users/Rodrigo Tavares"
+        captured = {}
+
+        def fake_build(**kwargs):
+            captured.update(kwargs)
+            child = MagicMock()
+            child.session_id = "child-session"
+            return child
+
+        creds = {
+            "provider": "copilot-acp",
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "model": None,
+            "command": "/home/rodrigo_tavares/.opencode/bin/opencode",
+            "args": ["acp", "--cwd", "/tmp/configured-repo"],
+        }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={"max_iterations": 3}),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=creds),
+            patch("tools.delegate_tool._is_wsl_runtime", return_value=True),
+            patch("tools.delegate_tool._build_child_agent", side_effect=fake_build),
+            patch(
+                "tools.delegate_tool._run_single_child",
+                return_value={
+                    "task_index": 0,
+                    "status": "completed",
+                    "summary": "ok",
+                    "api_calls": 1,
+                    "duration_seconds": 0.1,
+                },
+            ),
+        ):
+            result = json.loads(delegate_task(goal="smoke", parent_agent=parent))
+
+        self.assertEqual(result["results"][0]["status"], "completed")
+        self.assertEqual(
+            captured["override_acp_args"],
+            ["acp", "--cwd", "/tmp/configured-repo"],
+        )
+
     def test_no_parent_agent(self):
         result = json.loads(delegate_task(goal="test"))
         self.assertIn("error", result)

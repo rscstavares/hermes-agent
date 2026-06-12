@@ -377,10 +377,10 @@ def test_opencode_fallback_config_preserves_build_permissions(monkeypatch, tmp_p
     }))
     monkeypatch.setenv("OPENCODE_CONFIG", str(config))
 
-    fallback = json.loads(_opencode_config_content_for_model("opencode/nemotron-3-super-free"))
+    fallback = json.loads(_opencode_config_content_for_model("opencode/nemotron-3-ultra-free"))
 
-    assert fallback["model"] == "opencode/nemotron-3-super-free"
-    assert fallback["small_model"] == "opencode/nemotron-3-super-free"
+    assert fallback["model"] == "opencode/nemotron-3-ultra-free"
+    assert fallback["small_model"] == "opencode/nemotron-3-ultra-free"
     assert fallback["agent"]["build"]["permission"]["edit"] == "allow"
     assert fallback["agent"]["build"]["permission"]["external_directory"] == "deny"
 
@@ -390,7 +390,8 @@ def test_opencode_preflight_skips_rate_limited_default_and_uses_fallback(monkeyp
         acp_command="/usr/bin/opencode",
         acp_args=["acp", "--cwd", str(tmp_path)],
     )
-    monkeypatch.setenv("HERMES_OPENCODE_ACP_FALLBACK_MODELS", "opencode/nemotron-3-super-free")
+    monkeypatch.setenv("HERMES_OPENCODE_ACP_PREFLIGHT", "1")
+    monkeypatch.setenv("HERMES_OPENCODE_ACP_FALLBACK_MODELS", "opencode/nemotron-3-ultra-free")
     attempted: list[str] = []
 
     def fake_run(cmd, **kwargs):
@@ -404,11 +405,11 @@ def test_opencode_preflight_skips_rate_limited_default_and_uses_fallback(monkeyp
 
     def fake_once(prompt_text, *, timeout_seconds, extra_env=None):
         assert extra_env is not None
-        assert json.loads(extra_env["OPENCODE_CONFIG_CONTENT"])["model"] == "opencode/nemotron-3-super-free"
+        assert json.loads(extra_env["OPENCODE_CONFIG_CONTENT"])["model"] == "opencode/nemotron-3-ultra-free"
         return "fallback used", ""
 
     monkeypatch.setattr("agent.copilot_acp_client.subprocess.run", fake_run)
     monkeypatch.setattr(client, "_run_prompt_once", fake_once)
 
     assert client._run_prompt("hello", timeout_seconds=10) == ("fallback used", "")
-    assert attempted == ["configured-default", "opencode/nemotron-3-super-free"]
+    assert attempted == ["configured-default", "opencode/nemotron-3-ultra-free"]

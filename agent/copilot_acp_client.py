@@ -9,6 +9,7 @@ back into the minimal shape Hermes expects from an OpenAI client.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import re
@@ -30,16 +31,69 @@ from agent.file_safety import get_read_block_error, is_write_denied
 from agent.redact import redact_sensitive_text
 from tools.environments.local import hermes_subprocess_env
 
+logger = logging.getLogger(__name__)
+
 ACP_MARKER_BASE_URL = "acp://copilot"
 _DEFAULT_TIMEOUT_SECONDS = 900.0
 _OPENCODE_DEFAULT_FALLBACK_MODELS = (
     "opencode/deepseek-v4-flash-free",
     "opencode/mimo-v2.5-free",
-    "opencode/nemotron-3-super-free",
+    "opencode/nemotron-3-ultra-free",
     "opencode/big-pickle",
+    "opencode/north-mini-code-free",
 )
 _OPENCODE_PREFLIGHT_OK = "HERMES_OPENCODE_ACP_PREFLIGHT_OK"
 _OPENCODE_DEFAULT_PREFLIGHT_TIMEOUT_SECONDS = 45.0
+
+
+def _is_wsl() -> bool:
+    """Detect if running inside WSL (Windows Subsystem for Linux)."""
+    try:
+        with Path("/proc/version").open("r", encoding="utf-8") as f:
+            version = f.read().lower()
+            return "microsoft" in version or "wsl" in version
+    except Exception:
+        return False
+
+
+def _is_wsl2() -> bool:
+    """Detect WSL2 specifically (has real Linux kernel)."""
+    try:
+        with Path("/proc/sys/kernel/osrelease").open("r", encoding="utf-8") as f:
+            release = f.read().lower()
+            return "microsoft" in release or "wsl2" in release
+    except Exception:
+        return _is_wsl()
+
+
+def _get_wsl_opencode_config() -> dict:
+    """Load WSL-specific OpenCode ACP config from Hermes config.yaml."""
+    try:
+        from hermes_constants import get_hermes_home
+        import yaml
+        config_path = get_hermes_home() / "config.yaml"
+        if not config_path.exists():
+            return {}
+        raw = yaml.safe_load(config_path.read_text())
+        return (raw or {}).get("wsl_opencode_acp", {})
+    except Exception:
+        return {}
+
+
+def _get_effective_preflight_timeout() -> float:
+    """Get effective preflight timeout, adjusted for WSL if needed."""
+    wsl_config = _get_wsl_opencode_config() if _is_wsl() else {}
+    if wsl_config:
+        return float(wsl_config.get("preflight_timeout_seconds", _OPENCODE_DEFAULT_PREFLIGHT_TIMEOUT_SECONDS))
+    return _OPENCODE_DEFAULT_PREFLIGHT_TIMEOUT_SECONDS
+
+
+def _get_fallback_timeout_multiplier() -> float:
+    """Get fallback timeout multiplier for WSL environments."""
+    wsl_config = _get_wsl_opencode_config() if _is_wsl() else {}
+    if wsl_config:
+        return float(wsl_config.get("fallback_timeout_multiplier", 1.0))
+    return 1.0
 
 _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 _TOOL_CALL_JSON_RE = re.compile(r"\{\s*\"id\"\s*:\s*\"[^\"]+\"\s*,\s*\"type\"\s*:\s*\"function\"\s*,\s*\"function\"\s*:\s*\{.*?\}\s*\}", re.DOTALL)
@@ -438,9 +492,16 @@ def _derive_acp_cwd(
     if _is_opencode_invocation(acp_command, acp_args):
         for i, arg in enumerate(acp_args):
             if arg == "--cwd" and i + 1 < len(acp_args):
-                return str(Path(acp_args[i + 1]).resolve())
+                cwd_value = acp_args[i + 1]
+                # Support {{CWD}} placeholder for current working directory
+                if cwd_value == "{{CWD}}":
+                    return str(Path(os.getcwd()).resolve())
+                return str(Path(cwd_value).resolve())
             if arg.startswith("--cwd="):
-                return str(Path(arg[len("--cwd="):]).resolve())
+                cwd_value = arg[len("--cwd="):]
+                if cwd_value == "{{CWD}}":
+                    return str(Path(os.getcwd()).resolve())
+                return str(Path(cwd_value).resolve())
     return None
 
 
@@ -490,14 +551,8 @@ def _opencode_build_permissions() -> dict[str, str]:
 
 
 def _opencode_preflight_timeout() -> float:
-    raw = os.getenv("HERMES_OPENCODE_ACP_PREFLIGHT_TIMEOUT", "").strip()
-    if not raw:
-        return _OPENCODE_DEFAULT_PREFLIGHT_TIMEOUT_SECONDS
-    try:
-        value = float(raw)
-    except ValueError:
-        return _OPENCODE_DEFAULT_PREFLIGHT_TIMEOUT_SECONDS
-    return max(5.0, min(value, 180.0))
+    """Return preflight timeout, adjusted for WSL environments."""
+    return _get_effective_preflight_timeout()
 
 
 def _short_failure_text(stdout: str, stderr: str) -> str:
@@ -639,6 +694,16 @@ class CopilotACPClient:
         if not self._native_acp_tools:
             return self._run_prompt_once(prompt_text, timeout_seconds=timeout_seconds)
 
+        # On WSL, give each fallback attempt more time by adjusting the per-attempt timeout
+        fallback_multiplier = _get_fallback_timeout_multiplier()
+        is_wsl_env = _is_wsl()
+        if is_wsl_env and fallback_multiplier > 1.0:
+            # Log the WSL adjustment for debugging
+            logger.info(
+                f"WSL detected: applying OpenCode ACP fallback timeout multiplier {fallback_multiplier}x "
+                f"(preflight={_get_effective_preflight_timeout():.0f}s)"
+            )
+
         failures: list[str] = []
         attempts: list[tuple[str | None, dict[str, str] | None]] = [(None, None)]
         attempts.extend(
@@ -655,9 +720,14 @@ class CopilotACPClient:
             seen.add(model)
             try:
                 self._preflight_opencode_attempt(model_label=model or "configured-default", extra_env=extra_env)
+                # On WSL, reduce the timeout for subsequent fallback attempts to prevent cascading delays
+                attempt_timeout = timeout_seconds
+                if is_wsl_env and model is not None and fallback_multiplier > 1.0:
+                    # First attempt (configured-default) gets full timeout; fallbacks get reduced time
+                    attempt_timeout = timeout_seconds / fallback_multiplier
                 return self._run_prompt_once(
                     prompt_text,
-                    timeout_seconds=timeout_seconds,
+                    timeout_seconds=attempt_timeout,
                     extra_env=extra_env,
                 )
             except Exception as exc:

@@ -28,6 +28,7 @@ from concurrent.futures import (
     ThreadPoolExecutor,
     TimeoutError as FuturesTimeoutError,
 )
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
@@ -1026,6 +1027,15 @@ def _inherit_parent_base_url(parent_agent, fallback_base_url: Optional[str]) -> 
     return fallback_base_url or None
 
 
+def _is_wsl_runtime() -> bool:
+    """Best-effort WSL detection used for OpenCode ACP cwd safeguards."""
+    try:
+        version = Path("/proc/version").read_text(encoding="utf-8", errors="ignore").lower()
+        return "microsoft" in version or "wsl" in version
+    except Exception:
+        return False
+
+
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -1066,6 +1076,57 @@ def _build_child_agent(
     # degrades to 'leaf' — keeps the rule predictable.  Callers pass
     # the normalised role (_normalize_role ran in delegate_task) so
     # we only deal with 'leaf' or 'orchestrator' here.
+
+    # ── WSL detection for OpenCode ACP cwd handling ──────────────────────
+    # On WSL, ensure OpenCode ACP gets absolute --cwd to avoid /mnt/c hangs
+    wsl_env = _is_wsl_runtime()
+    # Check if this is an OpenCode ACP invocation (either via copilot-acp provider or direct opencode command)
+    def _is_opencode_cmd(cmd: str, args: list | None = None) -> bool:
+        if not cmd:
+            return False
+        name = Path(cmd).name.lower()
+        if name == "opencode" or name.startswith("opencode."):
+            return True
+        wrapper_names = {"npx", "bunx", "pnpm", "yarn", "node"}
+        if name not in wrapper_names:
+            return False
+        return any("opencode" in str(arg).lower() for arg in (args or []))
+
+    opencode_acp = (
+        override_provider == "copilot-acp"
+        or (override_acp_command and _is_opencode_cmd(override_acp_command, override_acp_args))
+        or (not override_provider and getattr(parent_agent, "provider", None) == "copilot-acp")
+    )
+    if wsl_env and opencode_acp:
+        # Preserve an explicit caller-supplied --cwd.  The orchestrator normally
+        # passes the target repo in acp_args; overwriting it with Hermes' own
+        # launch cwd (often /mnt/c/Users/...) is exactly what makes OpenCode ACP
+        # scan the Windows mount and then timeout/no-op.
+        workspace_path = _resolve_workspace_hint(parent_agent)
+        cwd_arg = str(Path(workspace_path).resolve()) if workspace_path else None
+        has_cwd = False
+        if override_acp_args:
+            for i, arg in enumerate(override_acp_args):
+                if arg == "--cwd" and i + 1 < len(override_acp_args):
+                    has_cwd = True
+                    if override_acp_args[i + 1] == "{{CWD}}" and cwd_arg:
+                        override_acp_args[i + 1] = cwd_arg
+                    break
+                elif arg.startswith("--cwd="):
+                    has_cwd = True
+                    if arg == "--cwd={{CWD}}" and cwd_arg:
+                        override_acp_args[i] = f"--cwd={cwd_arg}"
+                    break
+        if (
+            not has_cwd
+            and cwd_arg
+            and override_acp_command
+            and _is_opencode_cmd(override_acp_command, override_acp_args or [])
+        ):
+            if override_acp_args is None:
+                override_acp_args = []
+            override_acp_args.extend(["--cwd", cwd_arg])
+
     child_depth = getattr(parent_agent, "_delegate_depth", 0) + 1
     max_spawn = _get_max_spawn_depth()
     orchestrator_ok = _get_orchestrator_enabled() and child_depth < max_spawn
@@ -2211,6 +2272,41 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # Auto-inject OpenCode ACP --cwd for WSL when the configured delegation
+    # transport is OpenCode ACP and no explicit cwd is already present.  Never
+    # overwrite a configured/caller cwd with Hermes' launch cwd; on this WSL
+    # host that launch cwd is often /mnt/c/Users/... and causes OpenCode to
+    # snapshot the Windows mount until Hermes times out.
+    creds_provider = str(creds.get("provider") or "").lower()
+    creds_command = str(creds.get("command") or "").lower()
+    is_opencode_acp = (
+        "opencode" in creds_provider
+        or "copilot-acp" in creds_provider
+        or "opencode" in creds_command
+        or (creds.get("command") and Path(creds["command"]).name.lower() == "opencode")
+    )
+    if _is_wsl_runtime() and is_opencode_acp:
+        workspace_path = _resolve_workspace_hint(parent_agent)
+        cwd_arg = str(Path(workspace_path).resolve()) if workspace_path else None
+        if not creds.get("command") or "opencode" not in str(creds.get("command")).lower():
+            creds["command"] = "/home/rodrigo_tavares/.opencode/bin/opencode"
+        args = list(creds.get("args") or [])
+        has_cwd = False
+        for i, arg in enumerate(args):
+            if arg == "--cwd" and i + 1 < len(args):
+                has_cwd = True
+                if args[i + 1] == "{{CWD}}" and cwd_arg:
+                    args[i + 1] = cwd_arg
+                break
+            elif arg.startswith("--cwd="):
+                has_cwd = True
+                if arg == "--cwd={{CWD}}" and cwd_arg:
+                    args[i] = f"--cwd={cwd_arg}"
+                break
+        if not has_cwd and cwd_arg:
+            args.extend(["--cwd", cwd_arg])
+        creds["args"] = args
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()

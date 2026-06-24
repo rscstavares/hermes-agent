@@ -767,8 +767,21 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
             text = os.path.abspath(os.path.expanduser(str(candidate)))
         except Exception:
             continue
+        # The Hermes Desktop/TUI process can be launched from the Windows user
+        # profile root.  That path is technically absolute and exists, but it is
+        # a terrible implicit OpenCode ACP workspace: OpenCode snapshots /mnt/c
+        # and preflight can time out for every fallback model before the real
+        # task starts.  Treat only the generic Windows user-home mount as a stale
+        # launcher hint; real repos below /mnt/c/.../project are still allowed.
+        if text.startswith("/mnt/c/Users/") and len(Path(text).parts) <= 5:
+            linux_home = os.path.expanduser("~")
+            if os.path.isabs(linux_home) and os.path.isdir(linux_home):
+                continue
         if os.path.isabs(text) and os.path.isdir(text):
             return text
+    linux_home = os.path.expanduser("~")
+    if os.path.isabs(linux_home) and os.path.isdir(linux_home):
+        return linux_home
     return None
 
 

@@ -132,6 +132,44 @@ class TestBuildChildAgentOpenCodeCwd(unittest.TestCase):
             ["acp", "--cwd", workspace],
         )
 
+    def test_wsl_opencode_ignores_generic_windows_user_home_hint(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+        parent.terminal_cwd = None
+        parent.cwd = None
+        parent._subdirectory_hints = types.SimpleNamespace(
+            working_dir="/mnt/c/Users/Rodrigo Tavares"
+        )
+        self.captured_child_kwargs = {}
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._is_wsl_runtime", return_value=True),
+            patch.dict("os.environ", {"TERMINAL_CWD": "/mnt/c/Users/Rodrigo Tavares"}),
+            patch.dict(sys.modules, {"run_agent": types.SimpleNamespace(AIAgent=self._capture_child_kwargs)}),
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="smoke",
+                context=None,
+                toolsets=["terminal", "file"],
+                model=None,
+                max_iterations=3,
+                task_count=1,
+                parent_agent=parent,
+                override_acp_command="/home/rodrigo_tavares/.opencode/bin/opencode",
+                override_acp_args=["acp", "--cwd", "{{CWD}}"],
+            )
+
+        self.assertNotEqual(
+            self.captured_child_kwargs["acp_args"],
+            ["acp", "--cwd", "/mnt/c/Users/Rodrigo Tavares"],
+        )
+        self.assertEqual(
+            self.captured_child_kwargs["acp_args"],
+            ["acp", "--cwd", "/home/rodrigo_tavares"],
+        )
+
     def test_wsl_opencode_acp_provider_replaces_cwd_placeholder(self):
         parent = _make_mock_parent()
         parent.enabled_toolsets = ["terminal", "file"]

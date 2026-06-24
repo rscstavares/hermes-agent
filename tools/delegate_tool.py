@@ -748,12 +748,17 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     guessing `/workspace/...` for local repo tasks.
     """
     candidates = [
-        os.getenv("TERMINAL_CWD"),
+        getattr(parent_agent, "terminal_cwd", None),
+        getattr(parent_agent, "cwd", None),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
         ),
-        getattr(parent_agent, "terminal_cwd", None),
-        getattr(parent_agent, "cwd", None),
+        # Environment cwd is a last resort only.  In WSL/TUI sessions it can
+        # remain the Hermes launch directory (often /mnt/c/Users/...) even when
+        # the active parent agent has a narrower repository/workspace cwd.  If
+        # used first, OpenCode ACP scans the Windows mount and subagents appear
+        # to hang before producing output.
+        os.getenv("TERMINAL_CWD"),
     ]
     for candidate in candidates:
         if not candidate:
@@ -1080,7 +1085,8 @@ def _build_child_agent(
     # ── WSL detection for OpenCode ACP cwd handling ──────────────────────
     # On WSL, ensure OpenCode ACP gets absolute --cwd to avoid /mnt/c hangs
     wsl_env = _is_wsl_runtime()
-    # Check if this is an OpenCode ACP invocation (either via copilot-acp provider or direct opencode command)
+    # Check if this is an OpenCode ACP invocation (either via opencode-acp provider,
+    # the legacy copilot-acp shim with OpenCode command, or direct opencode command)
     def _is_opencode_cmd(cmd: str, args: list | None = None) -> bool:
         if not cmd:
             return False
@@ -1093,9 +1099,9 @@ def _build_child_agent(
         return any("opencode" in str(arg).lower() for arg in (args or []))
 
     opencode_acp = (
-        override_provider == "copilot-acp"
+        override_provider in {"copilot-acp", "opencode-acp"}
         or (override_acp_command and _is_opencode_cmd(override_acp_command, override_acp_args))
-        or (not override_provider and getattr(parent_agent, "provider", None) == "copilot-acp")
+        or (not override_provider and getattr(parent_agent, "provider", None) in {"copilot-acp", "opencode-acp"})
     )
     if wsl_env and opencode_acp:
         # Preserve an explicit caller-supplied --cwd.  The orchestrator normally
@@ -1276,9 +1282,10 @@ def _build_child_agent(
         effective_acp_args = []
 
     if override_acp_command:
-        # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
+        # If explicitly forcing an ACP transport override, the provider MUST be an
+        # ACP provider so run_agent.py initializes the CopilotACPClient shim.
         # so run_agent.py initializes the CopilotACPClient.
-        effective_provider = "copilot-acp"
+        effective_provider = "opencode-acp" if _is_opencode_cmd(override_acp_command, effective_acp_args) else "copilot-acp"
         effective_api_mode = "chat_completions"
 
     # Resolve reasoning config: delegation override > parent inherit

@@ -171,6 +171,7 @@ class TestProviderLabel:
         assert provider_label("stepfun") == "StepFun Step Plan"
         assert provider_label("copilot") == "GitHub Copilot"
         assert provider_label("copilot-acp") == "GitHub Copilot ACP"
+        assert provider_label("opencode-acp") == "OpenCode ACP"
         assert provider_label("auto") == "Auto"
 
     def test_unknown_provider_preserves_original_name(self):
@@ -214,6 +215,12 @@ class TestProviderModelIds:
         with patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={"api_key": "gh-token"}), \
              patch("hermes_cli.models._fetch_github_models", return_value=["gpt-5.4", "claude-sonnet-4.6"]):
             assert provider_model_ids("copilot-acp") == ["gpt-5.4", "claude-sonnet-4.6"]
+
+    def test_opencode_acp_uses_local_opencode_catalog(self):
+        assert provider_model_ids("opencode-acp")[:2] == [
+            "opencode/deepseek-v4-flash-free",
+            "opencode/mimo-v2.5-free",
+        ]
 
     def test_anthropic_provider_uses_configured_base_url_for_live_catalog(self):
         class _Resp:

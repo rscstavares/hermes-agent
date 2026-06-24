@@ -30,6 +30,7 @@ class TestProviderRegistry:
 
     @pytest.mark.parametrize("provider_id,name,auth_type", [
         ("copilot-acp", "GitHub Copilot ACP", "external_process"),
+        ("opencode-acp", "OpenCode ACP", "external_process"),
         ("copilot", "GitHub Copilot", "api_key"),
         ("huggingface", "Hugging Face", "api_key"),
         ("zai", "Z.AI / GLM", "api_key"),
@@ -488,6 +489,20 @@ class TestResolveApiKeyProviderCredentials:
         assert creds["args"] == ["--acp", "--stdio"]
         assert creds["source"] == "process"
 
+    def test_resolve_opencode_acp_with_local_cli(self, monkeypatch):
+        monkeypatch.setenv("HERMES_OPENCODE_ACP_COMMAND", "/opt/opencode")
+        monkeypatch.setenv("HERMES_OPENCODE_ACP_ARGS", "acp --cwd {{CWD}}")
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: command)
+
+        creds = resolve_external_process_provider_credentials("opencode-acp")
+
+        assert creds["provider"] == "opencode-acp"
+        assert creds["api_key"] == "opencode-acp"
+        assert creds["base_url"] == "acp://opencode"
+        assert creds["command"] == "/opt/opencode"
+        assert creds["args"] == ["acp", "--cwd", "{{CWD}}"]
+        assert creds["source"] == "process"
+
     def test_resolve_kimi_with_key(self, monkeypatch):
         monkeypatch.setenv("KIMI_API_KEY", "kimi-secret-key")
         creds = resolve_api_key_provider_credentials("kimi-coding")
@@ -692,6 +707,22 @@ class TestRuntimeProviderResolution:
         assert result["base_url"] == "acp://copilot"
         assert result["command"] == "/usr/local/bin/copilot"
         assert result["args"] == ["--acp", "--stdio", "--debug"]
+
+    def test_runtime_opencode_acp_uses_process_runtime(self, monkeypatch):
+        monkeypatch.setenv("HERMES_OPENCODE_ACP_COMMAND", "/opt/opencode")
+        monkeypatch.setenv("HERMES_OPENCODE_ACP_ARGS", "acp --cwd {{CWD}}")
+        monkeypatch.setattr("hermes_cli.auth.shutil.which", lambda command: command)
+
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        result = resolve_runtime_provider(requested="opencode-acp")
+
+        assert result["provider"] == "opencode-acp"
+        assert result["api_mode"] == "chat_completions"
+        assert result["api_key"] == "opencode-acp"
+        assert result["base_url"] == "acp://opencode"
+        assert result["command"] == "/opt/opencode"
+        assert result["args"] == ["acp", "--cwd", "{{CWD}}"]
 
 
 # =============================================================================

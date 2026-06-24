@@ -96,6 +96,72 @@ class TestBuildChildAgentOpenCodeCwd(unittest.TestCase):
             self.captured_child_kwargs["acp_args"],
             ["acp", "--cwd", "/tmp/target-repo"],
         )
+        self.assertEqual(self.captured_child_kwargs["provider"], "opencode-acp")
+
+    def test_wsl_opencode_prefers_parent_cwd_over_terminal_cwd_env(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+        workspace = "/tmp"
+        parent.terminal_cwd = workspace
+        parent._subdirectory_hints = types.SimpleNamespace(
+            working_dir="/mnt/c/Users/Rodrigo Tavares"
+        )
+        self.captured_child_kwargs = {}
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._is_wsl_runtime", return_value=True),
+            patch.dict("os.environ", {"TERMINAL_CWD": "/mnt/c/Users/Rodrigo Tavares"}),
+            patch.dict(sys.modules, {"run_agent": types.SimpleNamespace(AIAgent=self._capture_child_kwargs)}),
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="smoke",
+                context=None,
+                toolsets=["terminal", "file"],
+                model=None,
+                max_iterations=3,
+                task_count=1,
+                parent_agent=parent,
+                override_acp_command="/home/rodrigo_tavares/.opencode/bin/opencode",
+                override_acp_args=["acp", "--cwd", "{{CWD}}"],
+            )
+
+        self.assertEqual(
+            self.captured_child_kwargs["acp_args"],
+            ["acp", "--cwd", workspace],
+        )
+
+    def test_wsl_opencode_acp_provider_replaces_cwd_placeholder(self):
+        parent = _make_mock_parent()
+        parent.enabled_toolsets = ["terminal", "file"]
+        parent.terminal_cwd = "/tmp"
+        self.captured_child_kwargs = {}
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._is_wsl_runtime", return_value=True),
+            patch.dict(sys.modules, {"run_agent": types.SimpleNamespace(AIAgent=self._capture_child_kwargs)}),
+        ):
+            _build_child_agent(
+                task_index=0,
+                goal="smoke",
+                context=None,
+                toolsets=["terminal", "file"],
+                model=None,
+                max_iterations=3,
+                task_count=1,
+                parent_agent=parent,
+                override_provider="opencode-acp",
+                override_acp_command="/home/rodrigo_tavares/.opencode/bin/opencode",
+                override_acp_args=["acp", "--cwd", "{{CWD}}"],
+            )
+
+        self.assertEqual(self.captured_child_kwargs["provider"], "opencode-acp")
+        self.assertEqual(
+            self.captured_child_kwargs["acp_args"],
+            ["acp", "--cwd", "/tmp"],
+        )
 
     def test_wsl_opencode_adds_workspace_cwd_only_when_missing(self):
         parent = _make_mock_parent()

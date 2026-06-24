@@ -172,7 +172,12 @@ def _build_subprocess_env(extra_env: dict[str, str] | None = None) -> dict[str, 
     # credentials. Route through the central helper so Tier-1 secrets (gateway
     # bot tokens, GitHub auth, infra) are still stripped (#29157).
     env = hermes_subprocess_env(inherit_credentials=True)
-    env["HOME"] = _resolve_home_dir()
+    home = _resolve_home_dir()
+    env["HOME"] = home
+    hermes_home = str(env.get("HERMES_HOME") or "").strip()
+    profile_home = str(Path(hermes_home) / "home") if hermes_home else ""
+    if home and (not profile_home or Path(home).expanduser() != Path(profile_home).expanduser()):
+        env["HERMES_REAL_HOME"] = home
     from hermes_constants import apply_subprocess_home_env
 
     apply_subprocess_home_env(env)

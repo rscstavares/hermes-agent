@@ -2279,33 +2279,34 @@ def delegate_task(
     # host that launch cwd is often /mnt/c/Users/... and causes OpenCode to
     # snapshot the Windows mount until Hermes times out.
     creds_provider = str(creds.get("provider") or "").lower()
-    creds_command = str(creds.get("command") or "").lower()
-    is_opencode_acp = (
-        "opencode" in creds_provider
-        or "copilot-acp" in creds_provider
-        or "opencode" in creds_command
-        or (creds.get("command") and Path(creds["command"]).name.lower() == "opencode")
-    )
-    if _is_wsl_runtime() and is_opencode_acp:
+    creds_model = str(creds.get("model") or "").lower()
+    raw_command = creds.get("command")
+    creds_command = str(raw_command or "").lower()
+    creds_command_name = Path(creds_command).name if raw_command else ""
+    is_opencode_model = "opencode" in creds_provider or creds_model.startswith("opencode/")
+    is_opencode_command = "opencode" in creds_command or creds_command_name == "opencode"
+    if _is_wsl_runtime() and (is_opencode_model or is_opencode_command):
         workspace_path = _resolve_workspace_hint(parent_agent)
         cwd_arg = str(Path(workspace_path).resolve()) if workspace_path else None
-        if not creds.get("command") or "opencode" not in str(creds.get("command")).lower():
+        if not raw_command:
             creds["command"] = "/home/rodrigo_tavares/.opencode/bin/opencode"
+            is_opencode_command = True
         args = list(creds.get("args") or [])
-        has_cwd = False
-        for i, arg in enumerate(args):
-            if arg == "--cwd" and i + 1 < len(args):
-                has_cwd = True
-                if args[i + 1] == "{{CWD}}" and cwd_arg:
-                    args[i + 1] = cwd_arg
-                break
-            elif arg.startswith("--cwd="):
-                has_cwd = True
-                if arg == "--cwd={{CWD}}" and cwd_arg:
-                    args[i] = f"--cwd={cwd_arg}"
-                break
-        if not has_cwd and cwd_arg:
-            args.extend(["--cwd", cwd_arg])
+        if is_opencode_command:
+            has_cwd = False
+            for i, arg in enumerate(args):
+                if arg == "--cwd" and i + 1 < len(args):
+                    has_cwd = True
+                    if args[i + 1] == "{{CWD}}" and cwd_arg:
+                        args[i + 1] = cwd_arg
+                    break
+                elif arg.startswith("--cwd="):
+                    has_cwd = True
+                    if arg == "--cwd={{CWD}}" and cwd_arg:
+                        args[i] = f"--cwd={cwd_arg}"
+                    break
+            if not has_cwd and cwd_arg:
+                args.extend(["--cwd", cwd_arg])
         creds["args"] = args
 
     # Normalize to task list

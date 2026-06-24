@@ -290,6 +290,26 @@ class TestPermissionErrorHandling:
             # Result may be None (backend skipped) — the key point is no crash
             assert result is None or isinstance(result, str)
 
+    def test_check_tool_call_survives_unresolvable_home_path(self, project):
+        """Full check_tool_call should not crash when expanduser raises RuntimeError."""
+        tracker = SubdirectoryHintTracker(working_dir=str(project))
+        original_expanduser = Path.expanduser
+
+        def patched_expanduser(self):
+            if str(self).startswith("~"):
+                raise RuntimeError("Could not determine home directory.")
+            return original_expanduser(self)
+
+        with patch.object(Path, "expanduser", patched_expanduser):
+            result = tracker.check_tool_call(
+                "terminal",
+                {
+                    "command": "HOME=/home/rodrigo_tavares hermes --profile executor-nous chat -q ~/prompt.txt"
+                },
+            )
+
+        assert result is None
+
 
 class TestOutsideWorkspaceRejection:
     """Direct tests for _is_valid_subdir rejecting outside-workspace paths."""

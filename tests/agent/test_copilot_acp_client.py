@@ -396,6 +396,7 @@ def test_opencode_preflight_skips_rate_limited_default_and_uses_fallback(monkeyp
 
     def fake_run(cmd, **kwargs):
         assert cmd[:2] == ["/usr/bin/opencode", "run"]
+        assert cmd[2:4] == ["--dir", str(tmp_path)]
         config_content = (kwargs.get("env") or {}).get("OPENCODE_CONFIG_CONTENT")
         model = json.loads(config_content)["model"] if config_content else "configured-default"
         attempted.append(model)

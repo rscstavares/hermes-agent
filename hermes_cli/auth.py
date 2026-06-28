@@ -91,6 +91,7 @@ MINIMAX_OAUTH_REFRESH_SKEW_SECONDS = 60
 DEFAULT_QWEN_BASE_URL = "https://portal.qwen.ai/v1"
 DEFAULT_GITHUB_MODELS_BASE_URL = "https://api.githubcopilot.com"
 DEFAULT_COPILOT_ACP_BASE_URL = "acp://copilot"
+DEFAULT_OPENCODE_ACP_BASE_URL = "acp://opencode"
 DEFAULT_OLLAMA_CLOUD_BASE_URL = "https://ollama.com/v1"
 STEPFUN_STEP_PLAN_INTL_BASE_URL = "https://api.stepfun.ai/step_plan/v1"
 STEPFUN_STEP_PLAN_CN_BASE_URL = "https://api.stepfun.com/step_plan/v1"
@@ -224,6 +225,13 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         auth_type="external_process",
         inference_base_url=DEFAULT_COPILOT_ACP_BASE_URL,
         base_url_env_var="COPILOT_ACP_BASE_URL",
+    ),
+    "opencode-acp": ProviderConfig(
+        id="opencode-acp",
+        name="OpenCode ACP",
+        auth_type="external_process",
+        inference_base_url=DEFAULT_OPENCODE_ACP_BASE_URL,
+        base_url_env_var="OPENCODE_ACP_BASE_URL",
     ),
     "gemini": ProviderConfig(
         id="gemini",
@@ -1518,6 +1526,7 @@ def resolve_provider(
         "github": "copilot", "github-copilot": "copilot",
         "github-models": "copilot", "github-model": "copilot",
         "github-copilot-acp": "copilot-acp", "copilot-acp-agent": "copilot-acp",
+        "opencode-acp-agent": "opencode-acp", "opencode-cli-acp": "opencode-acp",
         "opencode": "opencode-zen", "zen": "opencode-zen",
         "qwen-portal": "qwen-oauth", "qwen-cli": "qwen-oauth", "qwen-oauth": "qwen-oauth",
         "hf": "huggingface", "hugging-face": "huggingface", "huggingface-hub": "huggingface",
@@ -6077,30 +6086,95 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     }
 
 
+def _coerce_external_process_args(value: Any) -> list[str]:
+    """Return an argv list from JSON/list/string config for ACP providers."""
+    if isinstance(value, (list, tuple)):
+        return [str(v) for v in value]
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return []
+        if raw.startswith("["):
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [str(v) for v in parsed]
+            except Exception:
+                pass
+        return shlex.split(raw)
+    return []
+
+
+def _load_opencode_acp_config() -> Dict[str, Any]:
+    """Load local OpenCode ACP defaults from config.yaml, if present."""
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        return {}
+    if not isinstance(cfg, dict):
+        return {}
+    for key in ("opencode_acp", "wsl_opencode_acp"):
+        section = cfg.get(key)
+        if isinstance(section, dict):
+            return section
+    return {}
+
+
+def _external_process_provider_runtime(provider_id: str, pconfig: ProviderConfig) -> Dict[str, Any]:
+    """Resolve command/args/base_url defaults for subprocess-backed providers."""
+    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    if not base_url:
+        base_url = pconfig.inference_base_url
+
+    if provider_id == "opencode-acp":
+        cfg = _load_opencode_acp_config()
+        command = (
+            os.getenv("HERMES_OPENCODE_ACP_COMMAND", "").strip()
+            or os.getenv("OPENCODE_CLI_PATH", "").strip()
+            or str(cfg.get("command") or "").strip()
+            or "opencode"
+        )
+        raw_args = os.getenv("HERMES_OPENCODE_ACP_ARGS", "").strip()
+        args = _coerce_external_process_args(raw_args) if raw_args else _coerce_external_process_args(cfg.get("args"))
+        if not args:
+            args = ["acp", "--cwd", "{{CWD}}"]
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+
+    resolved_command = shutil.which(command) if command else None
+    return {
+        "provider": provider_id,
+        "api_key": provider_id,
+        "base_url": base_url.rstrip("/"),
+        "command": command,
+        "args": args,
+        "resolved_command": resolved_command,
+        "source": "process",
+    }
+
+
 def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     """Status snapshot for providers that run a local subprocess."""
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
-
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    resolved_command = shutil.which(command) if command else None
+    runtime = _external_process_provider_runtime(provider_id, pconfig)
+    resolved_command = runtime.get("resolved_command")
+    base_url = str(runtime.get("base_url") or "")
     return {
         "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
         "provider": provider_id,
         "name": pconfig.name,
-        "command": command,
-        "args": args,
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
         "resolved_command": resolved_command,
         "base_url": base_url,
         "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
@@ -6124,7 +6198,7 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    if target in {"copilot-acp", "opencode-acp"}:
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
@@ -6274,32 +6348,31 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             code="invalid_provider",
         )
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
-    if not base_url:
-        base_url = pconfig.inference_base_url
-
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    resolved_command = shutil.which(command) if command else None
+    runtime = _external_process_provider_runtime(provider_id, pconfig)
+    base_url = str(runtime.get("base_url") or "")
+    command = str(runtime.get("command") or "")
+    resolved_command = runtime.get("resolved_command")
     if not resolved_command and not base_url.startswith("acp+tcp://"):
-        raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
-            provider=provider_id,
-            code="missing_copilot_cli",
-        )
+        if provider_id == "opencode-acp":
+            message = (
+                f"Could not find the OpenCode CLI command '{command}'. "
+                "Install OpenCode or set HERMES_OPENCODE_ACP_COMMAND/OPENCODE_CLI_PATH."
+            )
+            code = "missing_opencode_cli"
+        else:
+            message = (
+                f"Could not find the Copilot CLI command '{command}'. "
+                "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+            )
+            code = "missing_copilot_cli"
+        raise AuthError(message, provider=provider_id, code=code)
 
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": provider_id,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
-        "args": args,
+        "args": list(runtime.get("args") or []),
         "source": "process",
     }
 

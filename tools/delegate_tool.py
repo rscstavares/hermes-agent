@@ -2282,7 +2282,6 @@ def delegate_task(
     creds_command = str(creds.get("command") or "").lower()
     is_opencode_acp = (
         "opencode" in creds_provider
-        or "copilot-acp" in creds_provider
         or "opencode" in creds_command
         or (creds.get("command") and Path(creds["command"]).name.lower() == "opencode")
     )

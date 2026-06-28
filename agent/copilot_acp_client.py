@@ -672,7 +672,7 @@ class CopilotACPClient:
         if not _is_opencode_command(self._acp_command):
             return
         prompt = f"Read-only preflight. Do not edit files. Respond with exactly: {_OPENCODE_PREFLIGHT_OK}"
-        cmd = [self._acp_command, "run", prompt]
+        cmd = [self._acp_command, "run", "--dir", self._acp_cwd, prompt]
         try:
             result = subprocess.run(
                 cmd,
